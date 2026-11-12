@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Risk Score Map</title>
+<link rel="stylesheet" href="https://js.arcgis.com/4.31/esri/themes/light/main.css">
+<script src="https://js.arcgis.com/4.31/"></script>
+<style>
+  html, body { margin:0; height:100%; font-family: system-ui, sans-serif; }
+  #wrap { display:flex; height:100%; }
+  #panel { width:320px; padding:14px; overflow:auto; background:#fafafa; border-right:1px solid #ddd; box-sizing:border-box; }
+  #view { flex:1; }
+  h2 { margin:0 0 4px; font-size:18px; }
+  .hint { font-size:12px; color:#666; margin-bottom:12px; }
+  .var { padding:8px 0; border-bottom:1px solid #e3e3e3; }
+  .var label { font-weight:600; font-size:14px; }
+  .row { display:flex; align-items:center; gap:8px; font-size:12px; margin-top:4px; }
+  .row input[type=range] { flex:1; }
+  .w { width:22px; text-align:right; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="panel">
+    <h2>Risk Score</h2>
+    <div class="hint">Check variables to include them. Adjust weights with the sliders. "Invert" means a higher value = lower risk.</div>
+    <div id="controls"></div>
+  </div>
+  <div id="view"></div>
+</div>
+
+<script>
+// ====== EDIT THESE ======
+const API_KEY = "PASTE_YOUR_API_KEY_HERE";
+const LAYER_URL = "https://services6.arcgis.com/92HO0J5O9FPqRx5K/arcgis/rest/services/Downloads/FeatureServer/0";
+const VARIABLES = [
+  { field: "Estimates_", label: "Estimates_",  invert: false },
+  { field: "Estimates1", label: "Estimates1",  invert: false },
+  { field: "Estimate_1", label: "Estimate_1",  invert: false },
+  { field: "Estimate_2", label: "Estimate_2",  invert: false },
+  { field: "Estimate_3", label: "Estimate_3",  invert: false }
+];
+// ========================
+
+require(["esri/config","esri/Map","esri/views/MapView","esri/layers/FeatureLayer","esri/widgets/Legend"],
+function(esriConfig, Map, MapView, FeatureLayer, Legend) {
+  esriConfig.apiKey = API_KEY;
+
+  const layer = new FeatureLayer({ url: LAYER_URL, outFields: VARIABLES.map(v => v.field), opacity: 0.9 });
+  const map = new Map({ basemap: "arcgis/light-gray", layers: [layer] });
+  const view = new MapView({ container: "view", map: map });
+  view.ui.add(new Legend({ view: view }), "bottom-right");
+  layer.when(() => view.goTo(layer.fullExtent)).catch(console.error);
+
+  const ranges = {};
+  const state = {};
+  VARIABLES.forEach(v => state[v.field] = { on: true, weight: 5, invert: v.invert });
+
+  function buildExpression() {
+    const active = VARIABLES.filter(v => state[v.field].on);
+    if (!active.length) return "return null;";
+    let a = "var s = 0; var w = 0; var v = 0; var n = 0;\n";
+    active.forEach(v => {
+      const st = state[v.field], r = ranges[v.field] || { min: 0, max: 1 };
+      const span = (r.max - r.min) || 1;
+      a += `v = $feature["${v.field}"];\n`;
+      a += `if (!IsEmpty(v)) { n = (v - ${r.min}) / ${span}; ${st.invert ? "n = 1 - n;" : ""} s += n * ${st.weight}; w += ${st.weight}; }\n`;
+    });
+    a += "if (w == 0) { return null; }\nreturn (s / w) * 100;";
+    return a;
+  }
+
+  function updateRenderer() {
+    layer.renderer = {
+      type: "simple",
+      symbol: { type: "simple-fill", outline: { color: [120,120,120,0.6], width: 0.4 } },
+      visualVariables: [{
+        type: "color",
+        valueExpression: buildExpression(),
+        valueExpressionTitle: "Risk score (0-100)",
+        stops: [
+          { value: 0,   color: "#ffffb2" },
+          { value: 25,  color: "#fecc5c" },
+          { value: 50,  color: "#fd8d3c" },
+          { value: 75,  color: "#f03b20" },
+          { value: 100, color: "#bd0026" }
+        ]
+      }]
+    };
+  }
+
+  // Build controls
+  const box = document.getElementById("controls");
+  VARIABLES.forEach(v => {
+    const st = state[v.field];
+    const d = document.createElement("div");
+    d.className = "var";
+    d.innerHTML = `
+      <label><input type="checkbox" checked> ${v.label}</label>
+      <div class="row">Weight <input type="range" min="1" max="10" value="${st.weight}"><span class="w">${st.weight}</span></div>
+      <div class="row"><label><input type="checkbox" class="inv" ${st.invert ? "checked" : ""}> Invert (higher = lower risk)</label></div>`;
+    const [cb, inv] = d.querySelectorAll('input[type=checkbox]');
+    const sl = d.querySelector('input[type=range]');
+    const out = d.querySelector('.w');
+    cb.onchange = () => { st.on = cb.checked; updateRenderer(); };
+    inv.onchange = () => { st.invert = inv.checked; updateRenderer(); };
+    sl.oninput = () => { st.weight = Number(sl.value); out.textContent = sl.value; updateRenderer(); };
+    box.appendChild(d);
+  });
+
+  // Get min/max for scaling, then draw
+  const stats = [];
+  VARIABLES.forEach(v => {
+    ["min","max"].forEach(t => stats.push({
+      statisticType: t, onStatisticField: v.field, outStatisticFieldName: v.field + "_" + t
+    }));
+  });
+  layer.queryFeatures({ outStatistics: stats, returnGeometry: false })
+    .then(res => {
+      const a = res.features[0].attributes;
+      VARIABLES.forEach(v => ranges[v.field] = { min: a[v.field + "_min"], max: a[v.field + "_max"] });
+      updateRenderer();
+    })
+    .catch(err => { console.error("Stats query failed:", err); updateRenderer(); });
+});
+</script>
+</body>
+</html>
